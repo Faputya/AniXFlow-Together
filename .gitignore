@@ -1,0 +1,24 @@
+node_modules/
+out/
+dist/
+public/build/
+JSONResults/
+api_old/
+old/
+bundle.css
+bundle.js
+bundle.js.map
+mpv/
+*.log
+*.lnk
+.DS_Store
+Thumbs.db
+.env
+anixart-oapi.json
+.agents/
+
+# Ignore markdown files except README
+*.md
+!README.md
+!README.MD
+!readme.md

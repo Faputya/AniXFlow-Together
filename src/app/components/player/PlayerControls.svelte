@@ -1,6 +1,6 @@
 <script>
     import { createEventDispatcher } from "svelte";
-    import { syncMediaLocked } from "../stores/watchTogether.js";
+    import { syncMediaLocked, syncInRoom, chatOpen } from "../stores/watchTogether.js";
 
     export let video = null;
     export let isPaused = false;
@@ -112,6 +112,20 @@
                 style="filter: invert(1);"
             />
         </button>
+        {/if}
+        {#if $syncInRoom}
+            <button
+                class="gui-bottom-button"
+                title="Чат комнаты (Enter)"
+                onclick={(e) => {
+                    e.stopPropagation();
+                    chatOpen.update((v) => !v);
+                }}
+            >
+                <svg width="26" height="26" viewBox="0 0 24 24" fill="#fff" aria-hidden="true">
+                    <path d="M4 3h16a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-6.6l-4.2 3.5a.6.6 0 0 1-1-.46V18H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2Zm3 5.2a.9.9 0 1 0 0 1.8h10a.9.9 0 1 0 0-1.8H7Zm0 3.8a.9.9 0 1 0 0 1.8h6.5a.9.9 0 1 0 0-1.8H7Z" />
+                </svg>
+            </button>
         {/if}
         <button
             class="gui-bottom-button"

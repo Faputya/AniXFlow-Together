@@ -26,6 +26,7 @@
     import { VideoSync } from "../components/stores/videoSync.js";
     import BaseModal from "../components/modal/BaseModal.svelte";
     import WatchTogetherPanel from "../components/watch/WatchTogetherPanel.svelte";
+    import WatchChat from "../components/player/WatchChat.svelte";
 
     // Manager instances
     let hlsManager = new HlsManager();
@@ -1032,6 +1033,8 @@
         class:full={!availableGPU}
         class:hide={availableGPU}
     ></video>
+
+    <WatchChat />
 
     {#if showWatchModal}
         <BaseModal

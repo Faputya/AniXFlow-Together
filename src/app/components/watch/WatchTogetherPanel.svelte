@@ -14,6 +14,7 @@
     let serverUrl = saved.serverUrl;
     let name = saved.name;
     let preferOffline = saved.preferOffline;
+    let chatToasts = saved.chatToasts;
     let joinInput = "";
     let busy = false;
     let localError = "";
@@ -31,6 +32,7 @@
             serverUrl: normalizeServerUrl(serverUrl),
             name: name.trim(),
             preferOffline,
+            chatToasts,
         });
     }
 
@@ -200,6 +202,12 @@
             <input type="checkbox" bind:checked={preferOffline} onchange={persist} />
             <span>Если серия скачана — смотреть из файла</span>
         </label>
+
+        <label class="wt-check flex-row">
+            <input type="checkbox" bind:checked={chatToasts} onchange={persist} />
+            <span>Показывать новые сообщения чата в углу плеера</span>
+        </label>
+        <span class="wt-note">В плеере чат открывается клавишей Enter или кнопкой с облачком в панели управления.</span>
 
         <div class="wt-actions flex-row">
             <BaseMainButton height={34} style="default" onClickCallback={leaveRoom}>

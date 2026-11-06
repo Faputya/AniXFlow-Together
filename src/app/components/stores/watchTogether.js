@@ -152,6 +152,7 @@ const initialState = () => ({
     members: [],
     settings: { guestsCanControl: false },
     media: null,
+    chat: [], // сообщения чата комнаты (последние 100)
     room: null, // последнее авторитетное состояние воспроизведения
     waitingNames: [],
     error: null,
@@ -206,6 +207,7 @@ export class SyncClient {
             serverUrl: normalizeServerUrl(s.serverUrl || DEFAULT_SERVER_URL),
             name: s.name || "",
             preferOffline: s.preferOffline !== false,
+            chatToasts: s.chatToasts !== false,
         };
     }
 
@@ -455,6 +457,7 @@ export class SyncClient {
             case "welcome": return this._onWelcome(m);
             case "members": return this._onMembers(m);
             case "state": return this._onState(m);
+            case "chat": return this._onChat(m);
             case "settings": this._patch({ settings: m.settings }); this._emit("settings", m.settings); return;
             case "error": return this._onError(m);
         }
@@ -488,6 +491,7 @@ export class SyncClient {
             members: m.members,
             settings: m.settings,
             media: m.media,
+            chat: Array.isArray(m.chat) ? m.chat.slice(-100) : [],
             room: m.state,
             waitingNames: this._names(m.state.waiting, m.members),
             error: null,
@@ -514,6 +518,14 @@ export class SyncClient {
             this._emit("hostChanged", { isHost });
         }
         this._emit("members", m);
+    }
+
+    _onChat(m) {
+        const msg = { id: m.id, mid: m.mid, name: m.name, text: m.text, ts: m.ts };
+        const prev = this.snapshot.chat;
+        if (prev.some((x) => x.id === msg.id)) return;
+        this._patch({ chat: [...prev, msg].slice(-100) });
+        this._emit("chat", { ...msg, mine: msg.mid === this.snapshot.mid });
     }
 
     _onState(m) {
@@ -611,6 +623,13 @@ export class SyncClient {
     transferHost(mid) { return this._send({ t: "transfer", to: mid }); }
     renameSelf(name) { return this._send({ t: "name", name }); }
 
+    /** Сообщение в чат комнаты. Возвращает true, если оно ушло на сервер. */
+    sendChat(text) {
+        const t = String(text || "").trim();
+        if (!t || !this.inRoom) return false;
+        return this._send({ t: "chat", text: Array.from(t).slice(0, 300).join("") });
+    }
+
     setNotice(text) {
         this._patch({ notice: text });
         clearTimeout(this._noticeTimer);
@@ -634,5 +653,8 @@ export const syncPlaybackLocked = derived(client.store, (s) =>
 /** гость, которому нельзя менять серию/озвучку */
 export const syncMediaLocked = derived(client.store, (s) =>
     (s.phase === "connected" || s.phase === "reconnecting") && !s.isHost);
+
+/** открыто ли поле ввода чата в плеере */
+export const chatOpen = createStore(false);
 
 export const syncInRoom = derived(client.store, (s) => s.phase === "connected" || s.phase === "reconnecting");

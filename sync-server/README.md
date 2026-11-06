@@ -60,10 +60,10 @@ node --test             # тесты
 ## Протокол (для справки)
 
 JSON поверх WebSocket. Клиент → сервер: `ping`, `create`, `join`, `leave`, `play`, `pause`, `seek`,
-`rate`, `media`, `ready`, `unavailable`, `meta`, `settings`, `transfer`, `name`.
-Сервер → клиент: `pong`, `welcome`, `members`, `state`, `settings`, `error`.
+`rate`, `media`, `ready`, `unavailable`, `meta`, `settings`, `transfer`, `name`, `chat`.
+Сервер → клиент: `pong`, `welcome`, `members`, `state`, `settings`, `chat`, `error`.
 Состояние комнаты — `{playing, pos, at, rate, waiting}`: позиция `pos` была верна в серверный момент `at`,
 клиенты считают текущую позицию сами, выравнивая часы по `ping/pong`.
 
 Ограничения: до 5 человек в комнате, 6-символьные коды, лимиты на размер и частоту сообщений,
-не более 20 соединений с одного IP.
+не более 20 соединений с одного IP, чат — до 300 символов и 6 сообщений за 10 секунд.

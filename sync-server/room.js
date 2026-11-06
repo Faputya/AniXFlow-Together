@@ -31,6 +31,10 @@ const LIMITS = Object.freeze({
   TS_SKEW_MS: 2000,
   BUCKET_CAPACITY: 60,
   BUCKET_REFILL_PER_S: 30,
+  CHAT_MAX: 300,
+  CHAT_HISTORY: 30,
+  CHAT_BURST: 6, // не больше 6 сообщений...
+  CHAT_WINDOW_MS: 10000, // ...за 10 секунд от одного участника
 });
 
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
@@ -46,6 +50,13 @@ function str(v, max) {
   if (typeof v !== 'string') return '';
   // убираем управляющие символы
   return v.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, max);
+}
+
+/** Текст чата: без управляющих символов, обрезка по символам Unicode (эмодзи не рвутся). */
+function cleanChat(v) {
+  if (typeof v !== 'string') return '';
+  const t = v.replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim();
+  return Array.from(t).slice(0, LIMITS.CHAT_MAX).join('');
 }
 
 function sanitizeMedia(m) {
@@ -77,6 +88,8 @@ class Room {
     this.hostMid = null;
     this.settings = { guestsCanControl: false };
     this.media = null;
+    this.chat = [];
+    this.chatSeq = 0;
     this.seq = 0;
     this.midCounter = 0;
     /** @type {Map<string,{since:number,needSeq:number}>} */
@@ -373,6 +386,7 @@ class Hub {
       duration: null,
       joinedAt: now,
       disconnectedAt: null,
+      chatTimes: [],
     };
     room.members.set(cid, member);
     conn.cid = cid;
@@ -389,6 +403,7 @@ class Hub {
       members: room.membersView(),
       settings: room.settings,
       media: room.media,
+      chat: room.chat,
       state: { ...room.snapshot(), pos: room.st.pos, serverNow: now },
       serverNow: now,
     });
@@ -561,6 +576,22 @@ class Hub {
         if (!target || !target.conn) return this.sendError(member.conn, 'bad_request', 'Участник недоступен');
         room.hostMid = target.mid;
         return room.sendMembers();
+      }
+
+      case 'chat': {
+        const text = cleanChat(msg.text);
+        if (!text) return;
+        member.chatTimes = member.chatTimes.filter((t) => now - t < LIMITS.CHAT_WINDOW_MS);
+        if (member.chatTimes.length >= LIMITS.CHAT_BURST) {
+          return this.sendError(member.conn, 'chat_rate', 'Слишком быстро, подождите немного');
+        }
+        member.chatTimes.push(now);
+        room.chatSeq += 1;
+        // имя берём у сервера, а не из сообщения: подделать автора нельзя
+        const entry = { id: room.chatSeq, mid: member.mid, name: member.name, text, ts: now };
+        room.chat.push(entry);
+        if (room.chat.length > LIMITS.CHAT_HISTORY) room.chat.splice(0, room.chat.length - LIMITS.CHAT_HISTORY);
+        return room.broadcast({ t: 'chat', ...entry });
       }
 
       case 'name': {

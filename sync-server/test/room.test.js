@@ -401,3 +401,66 @@ test('в командах есть by — по нему клиент узнаё�
   send(hub, host, { t: 'seek', pos: 3 });
   assert.equal(gs[0].last('state').by, mid);
 });
+
+test('чат: сообщение получают все (и отправитель), имя берётся у сервера', () => {
+  const { hub, host, gs } = setup(1);
+  syncAll(hub, gs[0]);
+  const guestMid = gs[0].last('welcome').mid;
+  host.clear(); gs[0].clear();
+  send(hub, gs[0], { t: 'chat', text: '  Привет!  ', name: 'Подделка', mid: 'm1' });
+  for (const c of [host, gs[0]]) {
+    const m = c.last('chat');
+    assert.equal(m.text, 'Привет!');
+    assert.equal(m.name, 'Гость0', 'имя не из сообщения');
+    assert.equal(m.mid, guestMid);
+    assert.equal(m.id, 1);
+  }
+  send(hub, host, { t: 'chat', text: 'Второе' });
+  assert.equal(gs[0].last('chat').id, 2);
+});
+
+test('чат: пустое игнорируется, управляющие символы убираются, длина ограничена без разрыва эмодзи', () => {
+  const { hub, host, gs } = setup(1);
+  host.clear(); gs[0].clear();
+  send(hub, host, { t: 'chat', text: '   ' });
+  send(hub, host, { t: 'chat', text: 42 });
+  assert.equal(gs[0].all('chat').length, 0);
+  send(hub, host, { t: 'chat', text: 'a\nb\u0000c\td' });
+  assert.equal(gs[0].last('chat').text, 'a b c d');
+  send(hub, host, { t: 'chat', text: '😀'.repeat(400) });
+  const t = gs[0].last('chat').text;
+  assert.equal(Array.from(t).length, LIMITS.CHAT_MAX);
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(t), 'нет оборванных суррогатных пар');
+});
+
+test('чат: не больше 6 сообщений за 10 секунд, потом снова можно', () => {
+  const { hub, clock, host, gs } = setup(1);
+  gs[0].clear();
+  for (let i = 0; i < LIMITS.CHAT_BURST; i++) send(hub, host, { t: 'chat', text: 'm' + i });
+  assert.equal(gs[0].all('chat').length, LIMITS.CHAT_BURST);
+  send(hub, host, { t: 'chat', text: 'лишнее' });
+  assert.equal(host.last('error').code, 'chat_rate');
+  assert.equal(gs[0].all('chat').length, LIMITS.CHAT_BURST);
+  clock.t += LIMITS.CHAT_WINDOW_MS + 1;
+  clock.t += 1;
+  send(hub, host, { t: 'chat', text: 'снова' });
+  assert.equal(gs[0].last('chat').text, 'снова');
+});
+
+test('чат: вошедший позже видит историю (последние 30), чат вне комнаты запрещён', () => {
+  const { hub, clock, host, code } = setup(0);
+  for (let i = 1; i <= 40; i++) {
+    clock.t += 3000; // чтобы не упереться в лимит частоты
+    send(hub, host, { t: 'chat', text: 'сообщение ' + i });
+  }
+  const late = conn(hub, 'late');
+  send(hub, late, { t: 'join', cid: newCid(), code, name: 'Новичок' });
+  const h = late.last('welcome').chat;
+  assert.equal(h.length, LIMITS.CHAT_HISTORY);
+  assert.equal(h[0].text, 'сообщение 11');
+  assert.equal(h[h.length - 1].text, 'сообщение 40');
+
+  const stranger = conn(hub, 'stranger');
+  send(hub, stranger, { t: 'chat', text: 'я не в комнате' });
+  assert.equal(stranger.last('error').code, 'not_in_room');
+});

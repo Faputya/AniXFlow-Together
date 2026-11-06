@@ -178,6 +178,30 @@ const MEDIA = { releaseId: 42, title: 'Тест', dubberId: 1, dubberName: 'Оз
     assert.ok(Math.abs(host.video.currentTime - guest.video.currentTime) < 0.6);
   });
 
+  await t.test('чат: сообщения доходят, свои помечены, после обрыва связи история на месте', async () => {
+    const got = [];
+    const mineFlags = [];
+    guest.client.on('chat', (m) => { got.push(m); mineFlags.push(m.mine); });
+    host.client.sendChat('привет всем');
+    await waitFor(() => got.length === 1, 2000, 'сообщение у гостя');
+    assert.equal(got[0].text, 'привет всем');
+    assert.equal(got[0].name, 'Хост');
+    assert.equal(got[0].mine, false);
+
+    assert.equal(guest.client.sendChat('   '), false, 'пустое не отправляется');
+    assert.equal(guest.client.sendChat('  и тебе!  '), true);
+    await waitFor(() => host.client.snapshot.chat.length === 2, 2000, 'ответ у хоста');
+    await waitFor(() => got.length === 2, 2000, 'эхо у отправителя');
+    assert.equal(mineFlags[1], true, 'своё сообщение помечено mine');
+    assert.equal(host.client.snapshot.chat[1].text, 'и тебе!');
+
+    guest.client.ws.close();
+    await waitFor(() => guest.client.snapshot.phase === 'reconnecting', 2000, 'reconnecting');
+    await waitFor(() => guest.client.snapshot.phase === 'connected', 6000, 'снова в комнате');
+    assert.equal(guest.client.snapshot.chat.length, 2, 'история вернулась с сервера');
+    assert.equal(guest.client.snapshot.chat[0].text, 'привет всем');
+  });
+
   await t.test('хост меняет серию: гость получает openMedia и ждёт', async () => {
     guest.opened.length = 0;
     host.sync.noteMedia({ ...MEDIA, episodePos: 2, episodeName: '2 серия' }, { pos: 0, play: true });

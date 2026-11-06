@@ -39,7 +39,7 @@
             updateStatus = {
                 status: "error",
                 text: "Ошибка при проверке обновлений.",
-                url: "https://github.com/MjKey/AniXFlow/releases"
+                url: "https://github.com/Faputya/AniXFlow-Together/releases"
             };
         } finally {
             if (updateStatus?.status !== "checking") {

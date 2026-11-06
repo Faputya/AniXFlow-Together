@@ -201,7 +201,7 @@ let tray = null;
 let isQuitting = false;
 
 const server = 'https://update.electronjs.org';
-const feed = `${server}/MjKey/AniXFlow/${process.platform}-${process.arch}/${app.getVersion()}`;
+const feed = `${server}/Faputya/AniXFlow-Together/${process.platform}-${process.arch}/${app.getVersion()}`;
 const UserAgent = "AnixartApp/9.0 BETA 3-25021818 (Android 9; SDK 28; x86_64; ROG ASUS AI2201_B; ru)";
 const rpcClientId = '1372649290438148137';
 const SettingsPath = path.join(app.getPath("userData"), "settings.json");
@@ -267,7 +267,7 @@ function broadcastUpdaterStatus(statusData) {
 async function checkForUpdatesGitHub() {
   const currentVersion = app.getVersion();
   try {
-    const res = await net.fetch("https://api.github.com/repos/MjKey/AniXFlow/releases/latest", {
+    const res = await net.fetch("https://api.github.com/repos/Faputya/AniXFlow-Together/releases/latest", {
       headers: { "User-Agent": "AniXFlowApp" }
     });
     if (res.ok) {
@@ -279,7 +279,7 @@ async function checkForUpdatesGitHub() {
         status: isNewer ? "available" : "latest",
         latestVersion: latestTag,
         currentVersion: cleanCurrent,
-        releaseUrl: data.html_url || "https://github.com/MjKey/AniXFlow/releases",
+        releaseUrl: data.html_url || "https://github.com/Faputya/AniXFlow-Together/releases",
         text: isNewer ? `Доступно обновление v${latestTag}!` : `У вас установлена последняя версия (v${cleanCurrent})`
       };
     }

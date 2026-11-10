@@ -21,7 +21,11 @@ const crypto = require('node:crypto');
 const LIMITS = Object.freeze({
   MAX_MEMBERS: 5,
   LEAD_MS: 600,
-  HOLD_TIMEOUT_MS: 15000,
+  HOLD_TIMEOUT_MS: 15000, // ожидание загрузки серии / перемотки
+  STALL_HOLD_TIMEOUT_MS: 6000, // ожидание того, кто «завис» во время просмотра, — короче
+  STALL_WINDOW_MS: 60000, // если один участник «зависает» ...
+  STALL_STRIKES: 3, // ... 3 раза за минуту,
+  LAG_MS: 90000, // ...комната на 90 секунд перестаёт его ждать
   GRACE_MS: 30000,
   UNJOINED_TIMEOUT_MS: 10000,
   MAX_ROOMS: 1000,
@@ -38,7 +42,8 @@ const LIMITS = Object.freeze({
 });
 
 const CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-const CODE_LENGTH = 6;
+const CODE_LENGTH = 8; // 31^8 ≈ 8,5·10^11: код нельзя подобрать перебором
+const MAX_FAILED_JOINS = 5; // неверных кодов с одного соединения, потом оно закрывается
 
 function num(v, min, max, def) {
   const n = Number(v);
@@ -59,6 +64,13 @@ function cleanChat(v) {
   return Array.from(t).slice(0, LIMITS.CHAT_MAX).join('');
 }
 
+/** Число или null. Важно: Number(null) === 0, поэтому null отдельно (у серий из оффлайн-раздела нет озвучки). */
+function optNum(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 function sanitizeMedia(m) {
   if (!m || typeof m !== 'object') return null;
   const releaseId = Number(m.releaseId);
@@ -67,14 +79,14 @@ function sanitizeMedia(m) {
   const out = {
     releaseId,
     title: str(m.title, 120),
-    dubberId: Number.isFinite(Number(m.dubberId)) ? Number(m.dubberId) : null,
+    dubberId: optNum(m.dubberId),
     dubberName: str(m.dubberName, 60),
-    sourceId: Number.isFinite(Number(m.sourceId)) ? Number(m.sourceId) : null,
+    sourceId: optNum(m.sourceId),
     sourceName: str(m.sourceName, 40),
     episodePos,
     episodeName: str(m.episodeName, 80),
     offline: m.offline === true,
-    duration: Number.isFinite(Number(m.duration)) ? num(m.duration, 0, LIMITS.MAX_POS, null) : null,
+    duration: optNum(m.duration) === null ? null : num(m.duration, 0, LIMITS.MAX_POS, null),
   };
   if (JSON.stringify(out).length > LIMITS.MEDIA_MAX_JSON) return null;
   return out;
@@ -86,8 +98,11 @@ class Room {
     this.createdAt = now;
     this.members = new Map(); // cid -> member
     this.hostMid = null;
-    this.settings = { guestsCanControl: false };
+    this.settings = { guestsCanControl: false, waitForStalls: true };
     this.media = null;
+    this.mkey = null; // ключ текущей серии (для проверки, что у всех открыта одна и та же)
+    this.epoch = 0; // растёт при каждой смене серии: команды «из прошлой серии» игнорируются
+    this.lastNow = now;
     this.chat = [];
     this.chatSeq = 0;
     this.seq = 0;
@@ -125,6 +140,7 @@ class Room {
       connected: !!m.conn,
       duration: m.duration,
       unavailable: m.unavailable,
+      lagging: m.lagUntil > this.lastNow,
     }));
   }
 
@@ -137,6 +153,7 @@ class Room {
       pos: s.pos,
       at: s.at,
       rate: s.rate,
+      ep: this.epoch,
       waiting: [...this.hold.keys()],
     };
   }
@@ -158,16 +175,16 @@ class Room {
   }
 
   // ── hold / reconcile ────────────────────────────────────────────
-  /** участники, которых нужно ждать (подключены, синхронизированы, доступны) */
-  holdable(m) {
-    return !!m.conn && m.status === 'synced' && !m.unavailable;
+  /** участники, которых нужно ждать (подключены, синхронизированы, доступны, не «отстающие») */
+  holdable(m, now = this.lastNow) {
+    return !!m.conn && m.status === 'synced' && !m.unavailable && !(m.lagUntil > now);
   }
 
   holdAll(needSeq, now) {
     for (const m of this.members.values()) {
-      if (!this.holdable(m)) continue;
+      if (!this.holdable(m, now)) continue;
       m.ready = false;
-      this.hold.set(m.mid, { since: now, needSeq });
+      this.hold.set(m.mid, { since: now, needSeq, kind: 'load' });
     }
   }
 
@@ -271,12 +288,21 @@ class Hub {
       }
     }
     for (const room of [...this.rooms.values()]) {
+      room.lastNow = now;
       let changed = false;
       let holdChanged = false;
       for (const [mid, h] of [...room.hold]) {
-        if (now - h.since > LIMITS.HOLD_TIMEOUT_MS) {
+        const limit = h.kind === 'stall' ? LIMITS.STALL_HOLD_TIMEOUT_MS : LIMITS.HOLD_TIMEOUT_MS;
+        if (now - h.since > limit) {
           room.hold.delete(mid);
           holdChanged = true;
+        }
+      }
+      for (const m of room.members.values()) {
+        if (m.lagUntil && now >= m.lagUntil) {
+          m.lagUntil = 0;
+          m.stalls = [];
+          changed = true;
         }
       }
       for (const m of [...room.members.values()]) {
@@ -337,9 +363,16 @@ class Hub {
     const cid = this.validCid(msg.cid);
     if (!cid) return this.sendError(conn, 'bad_request', 'Неверный идентификатор клиента');
     if (conn.room) return this.sendError(conn, 'bad_request', 'Вы уже в комнате');
-    const code = str(msg.code, 12).toUpperCase();
+    const code = str(msg.code, 16).toUpperCase().replace(/[\s-]/g, '');
     const room = this.rooms.get(code);
-    if (!room) return this.sendError(conn, 'room_not_found', 'Комната не найдена или уже закрыта');
+    if (!room) {
+      conn.failedJoins = (conn.failedJoins || 0) + 1;
+      this.sendError(conn, 'room_not_found', 'Комната не найдена или уже закрыта');
+      if (conn.failedJoins >= MAX_FAILED_JOINS) {
+        try { conn.close(4003); } catch (_) {}
+      }
+      return;
+    }
 
     const existing = room.members.get(cid);
     if (existing) {
@@ -387,6 +420,8 @@ class Hub {
       joinedAt: now,
       disconnectedAt: null,
       chatTimes: [],
+      stalls: [],
+      lagUntil: 0,
     };
     room.members.set(cid, member);
     conn.cid = cid;
@@ -429,7 +464,11 @@ class Hub {
 
   // ── сообщения внутри комнаты ────────────────────────────────────
   handleRoomMessage(room, member, msg, now) {
+    room.lastNow = now;
     const s = room.st;
+    // Команда, отправленная до смены серии, приходит уже «из прошлого»: игнорируем, а не применяем к новой серии
+    const STALE_CHECKED = ['play', 'pause', 'seek', 'rate', 'ready'];
+    if (STALE_CHECKED.includes(msg.t) && msg.ep !== undefined && msg.ep !== room.epoch) return;
     const isHost = member.mid === room.hostMid;
     const clampTs = (ts) => {
       const t = Number(ts);
@@ -508,6 +547,9 @@ class Hub {
         if (same) return; // повторное сообщение о той же серии
         room.media = media;
         for (const m of room.members.values()) { m.unavailable = false; m.duration = null; }
+        room.epoch += 1;
+        room.mkey = [media.releaseId, media.dubberId ?? '-', media.sourceId ?? '-', media.episodePos].join(':');
+        for (const m of room.members.values()) { m.stalls = []; }
         s.pos = num(msg.pos, 0, LIMITS.MAX_POS, 0);
         s.at = now;
         s.playing = false;
@@ -524,6 +566,8 @@ class Hub {
           const h = room.hold.get(member.mid);
           // «готов» из прошлого (до применения seek/смены серии) игнорируем
           if (h && Number.isFinite(seq) && seq < h.needSeq) return;
+          // «готов» с другой серией открытой в плеере — не готов: ждём, пока откроется нужная
+          if (typeof msg.mk === 'string' && room.mkey && msg.mk !== room.mkey) return;
         }
         member.ready = ready;
         let promoted = false;
@@ -534,8 +578,18 @@ class Hub {
         let changed = false;
         if (ready) {
           changed = room.dropFromHold(member.mid);
-        } else if (room.holdable(member) && !room.hold.has(member.mid)) {
-          room.hold.set(member.mid, { since: now, needSeq: 0 });
+        } else if (room.holdable(member, now) && !room.hold.has(member.mid)) {
+          // «завис» во время просмотра. Если хост отключил ожидание — просто запоминаем
+          if (s.playing && room.settings.waitForStalls === false) return;
+          member.stalls = member.stalls.filter((t) => now - t < LIMITS.STALL_WINDOW_MS);
+          member.stalls.push(now);
+          if (member.stalls.length >= LIMITS.STALL_STRIKES) {
+            // слишком часто: остальные больше не ждут этого участника, он догоняет сам
+            member.lagUntil = now + LIMITS.LAG_MS;
+            room.sendMembers();
+            return;
+          }
+          room.hold.set(member.mid, { since: now, needSeq: 0, kind: 'stall' });
           changed = true;
         }
         if (promoted) room.sendMembers();
@@ -566,7 +620,10 @@ class Hub {
 
       case 'settings': {
         if (!isHost) return this.sendError(member.conn, 'forbidden', 'Только хост меняет настройки');
-        room.settings = { guestsCanControl: msg.guestsCanControl === true };
+        const next = { ...room.settings };
+        if ('guestsCanControl' in msg) next.guestsCanControl = msg.guestsCanControl === true;
+        if ('waitForStalls' in msg) next.waitForStalls = msg.waitForStalls !== false;
+        room.settings = next;
         return room.broadcast({ t: 'settings', settings: room.settings });
       }
 

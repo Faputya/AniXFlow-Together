@@ -25,6 +25,10 @@ class FakeVideo extends EventTarget {
     }, 10);
   }
   _emit(name) { setTimeout(() => this.dispatchEvent(new Event(name)), 0); }
+  get buffered() {
+    const ahead = this.bufferAhead ?? 0;
+    return { length: ahead > 0 ? 1 : 0, start: () => Math.max(0, this._t - 1), end: () => this._t + ahead };
+  }
   get currentTime() { return this._t; }
   set currentTime(v) {
     this._t = v; this.seeking = true; this._emit('seeking');
@@ -68,7 +72,7 @@ const MEDIA = { releaseId: 42, title: 'Тест', dubberId: 1, dubberName: 'Оз
     server.stopTimers(); server.close();
   });
 
-  const cfg = { LOOP_MS: 100, BUFFER_REPORT_DELAY_MS: 120, SEEK_DEBOUNCE_MS: 60 };
+  const cfg = { LOOP_MS: 100, STALL_POLL_MS: 40, STALL_REPORT_MS: 250, SEEK_DEBOUNCE_MS: 60 };
   function peer(name, skewMs = 0, seekMs = 80) {
     const client = new SyncClient({
       WebSocket: globalThis.WebSocket, fetch: null, now: () => Date.now() + skewMs,
@@ -168,6 +172,32 @@ const MEDIA = { releaseId: 42, title: 'Тест', dubberId: 1, dubberName: 'Оз
     await waitFor(() => Math.abs(host.video.currentTime - guest.video.currentTime) < 0.6, 5000, 'гость вернулся');
   });
 
+  await t.test('короткое подвисание (меньше порога) комнату не останавливает', async () => {
+    guest.video.stall(120);
+    await sleep(500);
+    assert.equal(host.video.paused, false);
+    assert.deepEqual(host.client.snapshot.waitingNames, []);
+  });
+
+  await t.test('тормоза декодера (данные есть, видео стоит) комнату не останавливают', async () => {
+    guest.video.bufferAhead = 6; // впереди 6 с данных: сеть ни при чём
+    guest.video.stall(900);
+    await sleep(700);
+    assert.equal(host.video.paused, false, 'хост продолжает играть');
+    assert.deepEqual(host.client.snapshot.waitingNames, []);
+    guest.video.bufferAhead = 0;
+    await waitFor(() => guest.video.readyState >= 3, 2000, 'гость снова готов');
+  });
+
+  await t.test('собственная подстроечная перемотка гостя комнату не останавливает', async () => {
+    let hostPaused = false;
+    host.video.addEventListener('pause', () => { hostPaused = true; });
+    guest.video._t += 4; // гость «ушёл» на 4 с — исправит перемоткой
+    await waitFor(() => Math.abs(host.video.currentTime - guest.video.currentTime) < 0.6, 5000, 'гость вернулся');
+    await sleep(400);
+    assert.equal(hostPaused, false, 'хост ни разу не вставал на паузу');
+  });
+
   await t.test('разрыв связи у гостя: он возвращается и синхронизируется', async () => {
     guest.client.ws.close();
     await waitFor(() => guest.client.snapshot.phase === 'reconnecting', 2000, 'reconnecting');
@@ -210,8 +240,25 @@ const MEDIA = { releaseId: 42, title: 'Тест', dubberId: 1, dubberName: 'Оз
     assert.equal(host.video.paused, true, 'хост ждёт загрузки гостя');
   });
 
+  await t.test('запоздавшие события старого видео не портят позицию новой серии', async () => {
+    host.opened = host.opened || [];
+    // хост переключает серию; старый элемент <video> ещё успевает «выстрелить» pause/seeked с позицией 1234
+    host.sync.noteMedia({ ...MEDIA, episodePos: 3, episodeName: '3 серия' }, { pos: 0, play: true });
+    host.video._t = 1234;
+    host.video.pause();
+    host.video.currentTime = 1234;
+    guest.sync.noteMedia({ ...MEDIA, episodePos: 3 });
+    guest.sync._onMetadata();
+    host.sync._onMetadata();
+    await waitFor(() => host.client.snapshot.media?.episodePos === 3, 2000, 'серия 3 в комнате');
+    await sleep(600);
+    const st = host.client.snapshot.room;
+    assert.ok(st.pos < 30, 'позиция новой серии не испорчена старым видео, pos=' + st.pos);
+  });
+
   await t.test('разрешение гостям управлять: гость ставит паузу, хост подчиняется', async () => {
-    guest.sync.noteMedia({ ...MEDIA, episodePos: 2 });
+    // к этому моменту в комнате 3-я серия (её открыл предыдущий сценарий)
+    guest.sync.noteMedia({ ...MEDIA, episodePos: 3 });
     guest.sync._onMetadata();
     host.sync._onMetadata();
     await waitFor(() => !host.video.paused && !guest.video.paused, 4000, 'оба играют после смены серии');

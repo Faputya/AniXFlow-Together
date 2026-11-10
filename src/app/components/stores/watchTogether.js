@@ -15,7 +15,7 @@ export const DEFAULT_SERVER_URL = "";
 
 const SETTINGS_KEY = "watchTogetherSettings";
 const CID_KEY = "watchTogetherCid";
-const CODE_RE = /^[A-HJKMNP-Z2-9]{6}$/;
+const CODE_RE = /^[A-HJKMNP-Z2-9]{6,10}$/; // сейчас коды из 8 символов; 6 — у комнат на старом сервере
 
 // ── минимальный store (контракт Svelte: subscribe/set/update) ────────────────
 export function createStore(initial) {
@@ -89,15 +89,24 @@ export function parseInvite(text) {
     const bare = raw.toUpperCase().replace(/[\s-]/g, "");
     if (CODE_RE.test(bare)) return { code: bare, server: null };
 
-    // код где-то внутри текста приглашения: «Код: K7F4QD»
-    const inText = raw.toUpperCase().match(/\b([A-HJKMNP-Z2-9]{6})\b/);
+    // код где-то внутри текста приглашения: «Код комнаты: K7F4-QD2M»
+    const upper = raw.toUpperCase();
+    const grouped = upper.match(/\b([A-HJKMNP-Z2-9]{4})-([A-HJKMNP-Z2-9]{4})\b/);
+    if (grouped) return { code: grouped[1] + grouped[2], server: null };
+    const inText = upper.match(/\b([A-HJKMNP-Z2-9]{8}|[A-HJKMNP-Z2-9]{6})\b/);
     return inText ? { code: inText[1], server: null } : null;
+}
+
+/** K7F4QD2M → K7F4-QD2M (так код проще читать и диктовать) */
+export function formatCode(code) {
+    const c = String(code || "");
+    return c.length === 8 ? `${c.slice(0, 4)}-${c.slice(4)}` : c;
 }
 
 export function buildInvite(code, serverUrl) {
     const server = normalizeServerUrl(serverUrl);
     const link = `anixflow-join://${code}` + (server ? `?server=${encodeURIComponent(server)}` : "");
-    const text = `Смотрим аниме вместе в AniXFlow! Код комнаты: ${code}\n${link}`;
+    const text = `Смотрим аниме вместе в AniXFlow! Код комнаты: ${formatCode(code)}\n${link}`;
     return { code, link, text };
 }
 
@@ -150,8 +159,9 @@ const initialState = () => ({
     hostMid: null,
     isHost: false,
     members: [],
-    settings: { guestsCanControl: false },
+    settings: { guestsCanControl: false, waitForStalls: true },
     media: null,
+    epoch: 0, // номер «поколения» серии: команды с другим номером сервер игнорирует
     chat: [], // сообщения чата комнаты (последние 100)
     room: null, // последнее авторитетное состояние воспроизведения
     waitingNames: [],
@@ -491,6 +501,7 @@ export class SyncClient {
             members: m.members,
             settings: m.settings,
             media: m.media,
+            epoch: m.state?.ep ?? 0,
             chat: Array.isArray(m.chat) ? m.chat.slice(-100) : [],
             room: m.state,
             waitingNames: this._names(m.state.waiting, m.members),
@@ -530,6 +541,7 @@ export class SyncClient {
 
     _onState(m) {
         const patch = { room: m, waitingNames: this._names(m.waiting, this.snapshot.members) };
+        if (m.ep !== undefined) patch.epoch = m.ep;
         if (m.media) patch.media = m.media;
         this._patch(patch);
         this._emit("state", m);
@@ -611,15 +623,22 @@ export class SyncClient {
     }
 
     // ── команды ─────────────────────────────────────────────────────
-    sendPlay(pos) { return this._send({ t: "play", pos, ts: this.serverNow() }); }
-    sendPause(pos) { return this._send({ t: "pause", pos }); }
-    sendSeek(pos) { return this._send({ t: "seek", pos }); }
-    sendRate(rate, pos) { return this._send({ t: "rate", rate, pos, ts: this.serverNow() }); }
+    // epoch в каждой команде: если серия успела смениться, сервер отбросит команду как устаревшую
+    sendPlay(pos) { return this._send({ t: "play", pos, ts: this.serverNow(), ep: this.snapshot.epoch }); }
+    sendPause(pos) { return this._send({ t: "pause", pos, ep: this.snapshot.epoch }); }
+    sendSeek(pos) { return this._send({ t: "seek", pos, ep: this.snapshot.epoch }); }
+    sendRate(rate, pos) { return this._send({ t: "rate", rate, pos, ts: this.serverNow(), ep: this.snapshot.epoch }); }
     sendMedia(media, pos = 0, play = true) { return this._send({ t: "media", media, pos, play }); }
-    sendReady(ready, pos, seq) { return this._send({ t: "ready", ready, pos, seq }); }
+    sendReady(ready, pos, seq) {
+        const msg = { t: "ready", ready, pos, seq, ep: this.snapshot.epoch };
+        // ключ серии, открытой в плеере: сервер не примет «готов», если там другая серия
+        if (this.loadedMediaKey) msg.mk = this.loadedMediaKey;
+        return this._send(msg);
+    }
     sendUnavailable(on) { return this._send({ t: "unavailable", on }); }
     sendMeta(duration) { return this._send({ t: "meta", duration }); }
     setGuestsCanControl(on) { return this._send({ t: "settings", guestsCanControl: !!on }); }
+    setWaitForStalls(on) { return this._send({ t: "settings", waitForStalls: !!on }); }
     transferHost(mid) { return this._send({ t: "transfer", to: mid }); }
     renameSelf(name) { return this._send({ t: "name", name }); }
 

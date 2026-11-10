@@ -11,6 +11,34 @@ protocol.registerSchemesAsPrivileged([
 
 const { initDownloader } = require('./downloader');
 const watchInvite = require('./watchInvite');
+
+// ── Безопасность IPC ─────────────────────────────────────────────────────────
+// Команды главного процесса (выключение ПК, настройки, обновления, скачивание и т.д.) принимаются только
+// от самого интерфейса приложения. Вызов со страницы из интернета (http/https, кроме localhost для
+// режима разработки) отклоняется. Если адрес отправителя определить не удалось, вызов разрешается,
+// чтобы не сломать приложение из-за особенностей схемы app://.
+function isTrustedIpcSender(event) {
+  try {
+    const url = (event && event.senderFrame && event.senderFrame.url) || '';
+    if (!url) return true;
+    const u = new URL(url);
+    if (u.protocol === 'http:' || u.protocol === 'https:') {
+      return u.hostname === 'localhost' || u.hostname === '127.0.0.1';
+    }
+    return true;
+  } catch (_) {
+    return true;
+  }
+}
+const _ipcHandle = ipcMain.handle.bind(ipcMain);
+ipcMain.handle = (channel, listener) =>
+  _ipcHandle(channel, (event, ...args) => {
+    if (!isTrustedIpcSender(event)) {
+      console.warn(`[security] IPC "${channel}" отклонён: ${event.senderFrame && event.senderFrame.url}`);
+      throw new Error('Blocked IPC call from untrusted origin');
+    }
+    return listener(event, ...args);
+  });
 const path = require('node:path');
 const crypto = require('crypto');
 const o = require('openurl');
@@ -200,8 +228,12 @@ let mainWindow;
 let tray = null;
 let isQuitting = false;
 
+// Единственный источник обновлений — репозиторий этого форка. Другие адреса не используются:
+// ни автообновление (Squirrel), ни запасная проверка через GitHub API не обращаются к чужим репозиториям.
+const UPDATE_REPO = 'Faputya/AniXFlow-Together';
 const server = 'https://update.electronjs.org';
-const feed = `${server}/Faputya/AniXFlow-Together/${process.platform}-${process.arch}/${app.getVersion()}`;
+const feed = `${server}/${UPDATE_REPO}/${process.platform}-${process.arch}/${app.getVersion()}`;
+const isOwnUpdateUrl = (u) => typeof u === 'string' && u.startsWith(`${server}/${UPDATE_REPO}/`);
 const UserAgent = "AnixartApp/9.0 BETA 3-25021818 (Android 9; SDK 28; x86_64; ROG ASUS AI2201_B; ru)";
 const rpcClientId = '1372649290438148137';
 const SettingsPath = path.join(app.getPath("userData"), "settings.json");
@@ -267,7 +299,7 @@ function broadcastUpdaterStatus(statusData) {
 async function checkForUpdatesGitHub() {
   const currentVersion = app.getVersion();
   try {
-    const res = await net.fetch("https://api.github.com/repos/Faputya/AniXFlow-Together/releases/latest", {
+    const res = await net.fetch(`https://api.github.com/repos/${UPDATE_REPO}/releases/latest`, {
       headers: { "User-Agent": "AniXFlowApp" }
     });
     if (res.ok) {
@@ -279,7 +311,9 @@ async function checkForUpdatesGitHub() {
         status: isNewer ? "available" : "latest",
         latestVersion: latestTag,
         currentVersion: cleanCurrent,
-        releaseUrl: data.html_url || "https://github.com/Faputya/AniXFlow-Together/releases",
+        releaseUrl: (typeof data.html_url === "string" && data.html_url.startsWith(`https://github.com/${UPDATE_REPO}/`))
+          ? data.html_url
+          : `https://github.com/${UPDATE_REPO}/releases`,
         text: isNewer ? `Доступно обновление v${latestTag}!` : `У вас установлена последняя версия (v${cleanCurrent})`
       };
     }
@@ -343,6 +377,7 @@ function initAutoUpdater() {
     });
 
     try {
+      if (!isOwnUpdateUrl(feed)) throw new Error('Источник обновлений не из доверенного репозитория');
       autoUpdater.setFeedURL({ url: feed });
     } catch (e) {
       console.error("AutoUpdater setFeedURL error:", e);
@@ -1173,6 +1208,19 @@ ipcMain.handle("download:episode", async (event, { url, defaultFileName, referer
   }
 });
 
+// Протокол anixflow:// отдаёт плееру скачанные серии. Читать можно только файлы внутри offline_storage:
+// иначе любая страница с таким адресом могла бы запросить произвольный файл на диске.
+function isInsideOfflineStorage(filePath) {
+  try {
+    const root = fs.realpathSync(path.join(app.getPath('userData'), 'offline_storage'));
+    const real = fs.realpathSync(filePath);
+    const rel = path.relative(root, real);
+    return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+  } catch (_) {
+    return false;
+  }
+}
+
 async function handleAnixflowRequest(request) {
   try {
     const urlStr = request.url;
@@ -1193,8 +1241,15 @@ async function handleAnixflowRequest(request) {
     if (!fs.existsSync(filePath)) {
       return new Response('File not found', { status: 404 });
     }
+    if (!isInsideOfflineStorage(filePath)) {
+      console.warn('[security] anixflow:// вне offline_storage отклонён:', filePath);
+      return new Response('Forbidden', { status: 403 });
+    }
 
     const stat = fs.statSync(filePath);
+    if (!stat.isFile()) {
+      return new Response('Forbidden', { status: 403 });
+    }
     const fileSize = stat.size;
     const rangeHeader = request.headers ? (request.headers.get ? request.headers.get('range') : request.headers['range']) : null;
 

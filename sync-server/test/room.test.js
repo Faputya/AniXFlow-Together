@@ -55,7 +55,7 @@ function syncAll(hub, ...conns) {
 
 test('создание комнаты и вход гостя', () => {
   const { host, gs, code } = setup(1);
-  assert.match(code, /^[A-HJKMNP-Z2-9]{6}$/);
+  assert.match(code, /^[A-HJKMNP-Z2-9]{8}$/);
   assert.equal(gs[0].last('welcome').code, code);
   assert.equal(gs[0].last('welcome').members.length, 2);
   assert.equal(host.last('members').members.length, 2);
@@ -73,7 +73,7 @@ test('комната вмещает максимум 5 человек', () => {
 test('несуществующая комната и неверный cid', () => {
   const { hub } = makeHub();
   const c = conn(hub, 'c');
-  send(hub, c, { t: 'join', cid: newCid(), code: 'ZZZZZZ', name: 'a' });
+  send(hub, c, { t: 'join', cid: newCid(), code: 'ZZZZZZZZ', name: 'a' });
   assert.equal(c.last('error').code, 'room_not_found');
   send(hub, c, { t: 'create', cid: 'x', name: 'a' });
   assert.equal(c.last('error').code, 'bad_request');
@@ -463,4 +463,158 @@ test('чат: вошедший позже видит историю (после�
   const stranger = conn(hub, 'stranger');
   send(hub, stranger, { t: 'chat', text: 'я не в комнате' });
   assert.equal(stranger.last('error').code, 'not_in_room');
+});
+
+test('вход: код можно вводить с дефисом, пробелами и в нижнем регистре', () => {
+  const { hub, code } = setup(0);
+  const g = conn(hub, 'g');
+  const grouped = (code.slice(0, 4) + ' - ' + code.slice(4)).toLowerCase();
+  send(hub, g, { t: 'join', cid: newCid(), code: grouped, name: 'Гость' });
+  assert.equal(g.last('welcome').code, code);
+});
+
+test('вход: после 5 неверных кодов соединение закрывается (перебор невозможен)', () => {
+  const { hub } = makeHub();
+  const c = conn(hub, 'brute');
+  for (let i = 0; i < 5; i++) send(hub, c, { t: 'join', cid: newCid(), code: 'AAAAAAA' + i, name: 'x' });
+  assert.equal(c.all('error').length, 5);
+  assert.equal(c.closed, true);
+});
+
+test('устаревшие команды: события из прошлой серии не портят позицию новой', () => {
+  const { hub, clock, host, gs } = setup(1);
+  syncAll(hub, gs[0]);
+  const m1 = { releaseId: 1, episodePos: 1 };
+  send(hub, host, { t: 'media', media: m1 });
+  const e1 = host.last('state').ep;
+  assert.equal(e1, 1);
+  send(hub, host, { t: 'ready', ready: true, seq: host.last('state').seq, ep: e1 });
+  send(hub, gs[0], { t: 'ready', ready: true, seq: host.last('state').seq, ep: e1 });
+  send(hub, host, { t: 'play', pos: 1200, ts: clock.t, ep: e1 });
+
+  send(hub, host, { t: 'media', media: { releaseId: 1, episodePos: 2 }, pos: 0, play: true });
+  const e2 = host.last('state').ep;
+  assert.equal(e2, 2);
+  const before = host.last('state');
+
+  // «запоздавшие» события старого видео приходят с прошлой эпохой
+  send(hub, host, { t: 'pause', pos: 1234, ep: e1 });
+  send(hub, host, { t: 'seek', pos: 1234, ep: e1 });
+  send(hub, host, { t: 'play', pos: 1234, ts: clock.t, ep: e1 });
+  send(hub, gs[0], { t: 'ready', ready: true, seq: before.seq, ep: e1 });
+  assert.equal(host.last('state').seq, before.seq, 'новых состояний не появилось');
+  assert.equal(host.last('state').pos, 0);
+
+  // команда с актуальной эпохой работает
+  send(hub, host, { t: 'pause', pos: 5, ep: e2 });
+  assert.equal(host.last('state').pos, 5);
+});
+
+test('проверка серии: «готов» с другой серией в плеере не снимает ожидание', () => {
+  const { hub, host, gs } = setup(1);
+  syncAll(hub, gs[0]);
+  send(hub, host, { t: 'media', media: { releaseId: 7, dubberId: 3, sourceId: 9, episodePos: 4 } });
+  const st = host.last('state');
+  assert.equal(st.waiting.length, 2);
+  send(hub, host, { t: 'ready', ready: true, seq: st.seq, ep: st.ep, mk: '7:3:9:4' });
+  send(hub, gs[0], { t: 'ready', ready: true, seq: st.seq, ep: st.ep, mk: '7:3:9:3' }); // открыта 3-я серия
+  assert.equal(host.last('state').playing, false);
+  assert.deepEqual(host.last('state').waiting, [gs[0].last('welcome').mid]);
+  send(hub, gs[0], { t: 'ready', ready: true, seq: st.seq, ep: st.ep, mk: '7:3:9:4' });
+  assert.equal(host.last('state').playing, true);
+  // старые клиенты (без mk) продолжают работать
+  const { hub: h2, host: ho2, gs: g2 } = setup(1);
+  syncAll(h2, g2[0]);
+  send(h2, ho2, { t: 'media', media: { releaseId: 7, dubberId: 3, sourceId: 9, episodePos: 4 } });
+  const s2 = ho2.last('state');
+  send(h2, ho2, { t: 'ready', ready: true, seq: s2.seq });
+  send(h2, g2[0], { t: 'ready', ready: true, seq: s2.seq });
+  assert.equal(ho2.last('state').playing, true);
+});
+
+test('зависание во время просмотра: ждём недолго (6 с), загрузку серии — дольше (15 с)', () => {
+  const { hub, clock, host, gs } = setup(1);
+  syncAll(hub, gs[0]);
+  send(hub, host, { t: 'play', pos: 0, ts: clock.t });
+  send(hub, gs[0], { t: 'ready', ready: false, pos: 0 });
+  assert.equal(host.last('state').playing, false);
+  clock.t += LIMITS.STALL_HOLD_TIMEOUT_MS + 1;
+  hub.tick();
+  assert.equal(host.last('state').playing, true, 'через 6 с комната продолжила без зависшего');
+  assert.equal(host.last('state').reason, 'hold-timeout');
+
+  // загрузка новой серии — прежний срок
+  send(hub, host, { t: 'media', media: { releaseId: 1, episodePos: 1 } });
+  clock.t += LIMITS.STALL_HOLD_TIMEOUT_MS + 1;
+  hub.tick();
+  assert.equal(host.last('state').playing, false, 'серия ещё грузится — ждём');
+  clock.t += LIMITS.HOLD_TIMEOUT_MS;
+  hub.tick();
+  assert.equal(host.last('state').playing, true);
+});
+
+test('частые зависания: на третий раз за минуту комната перестаёт ждать этого участника', () => {
+  const { hub, clock, host, gs } = setup(1);
+  const g = gs[0];
+  syncAll(hub, g);
+  send(hub, host, { t: 'play', pos: 0, ts: clock.t });
+  const mid = g.last('welcome').mid;
+
+  for (let i = 0; i < 2; i++) {
+    clock.t += 5000;
+    send(hub, g, { t: 'ready', ready: false, pos: 10 });
+    assert.equal(host.last('state').playing, false, `зависание ${i + 1}: ждём`);
+    send(hub, g, { t: 'ready', ready: true, seq: host.last('state').seq });
+    assert.equal(host.last('state').playing, true);
+  }
+  clock.t += 5000;
+  send(hub, g, { t: 'ready', ready: false, pos: 10 });
+  assert.equal(host.last('state').playing, true, 'третий раз — не ждём');
+  const me = host.last('members').members.find((m) => m.mid === mid);
+  assert.equal(me.lagging, true);
+
+  // пока «отстающий», он не задерживает ни перемотку, ни смену серии
+  send(hub, host, { t: 'seek', pos: 300 });
+  const r = host.last('state');
+  assert.deepEqual(r.waiting, [host.last('welcome').mid], 'ждём только хоста');
+
+  // через 90 секунд статус снимается
+  clock.t += LIMITS.LAG_MS + 1;
+  hub.tick();
+  assert.equal(host.last('members').members.find((m) => m.mid === mid).lagging, false);
+});
+
+test('хост может отключить ожидание зависших участников', () => {
+  const { hub, clock, host, gs } = setup(1);
+  syncAll(hub, gs[0]);
+  send(hub, gs[0], { t: 'settings', waitForStalls: false });
+  assert.equal(gs[0].last('error').code, 'forbidden');
+  send(hub, host, { t: 'settings', waitForStalls: false });
+  assert.equal(gs[0].last('settings').settings.waitForStalls, false);
+  assert.equal(gs[0].last('settings').settings.guestsCanControl, false, 'прочие настройки не сбросились');
+  send(hub, host, { t: 'play', pos: 0, ts: clock.t });
+  send(hub, gs[0], { t: 'ready', ready: false, pos: 0 });
+  assert.equal(host.last('state').playing, true, 'комната не остановилась');
+  // но на загрузке серии ожидание остаётся
+  send(hub, host, { t: 'settings', guestsCanControl: true });
+  assert.equal(gs[0].last('settings').settings.waitForStalls, false);
+  send(hub, host, { t: 'media', media: { releaseId: 1, episodePos: 1 } });
+  assert.equal(host.last('state').waiting.length, 2);
+});
+
+test('серия без озвучки (из оффлайн-раздела): null не превращается в 0, ключ серии совпадает', () => {
+  const m = sanitizeMedia({ releaseId: 7, episodePos: 4, dubberId: null, sourceId: null });
+  assert.equal(m.dubberId, null);
+  assert.equal(m.sourceId, null);
+  assert.equal(m.duration, null);
+
+  const { hub, host, gs } = setup(1);
+  syncAll(hub, gs[0]);
+  send(hub, host, { t: 'media', media: { releaseId: 7, episodePos: 4, dubberId: null, sourceId: null } });
+  const st = host.last('state');
+  assert.equal(st.media.dubberId, null);
+  // клиент считает ключ как releaseId:dubber:source:episode, где пустое — «-»
+  send(hub, host, { t: 'ready', ready: true, seq: st.seq, ep: st.ep, mk: '7:-:-:4' });
+  send(hub, gs[0], { t: 'ready', ready: true, seq: st.seq, ep: st.ep, mk: '7:-:-:4' });
+  assert.equal(host.last('state').playing, true);
 });

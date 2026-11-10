@@ -3,7 +3,7 @@
     import Icon from "../elements/Icon.svelte";
     import CloseIcon from "../../icons/close.svg";
     import BaseMainButton from "../buttons/BaseMainButton.svelte";
-    import { watch, client, parseInvite, normalizeServerUrl, buildInvite } from "../stores/watchTogether.js";
+    import { watch, client, parseInvite, normalizeServerUrl, buildInvite, formatCode } from "../stores/watchTogether.js";
 
     export let args = null;
     export let showed = true;
@@ -52,7 +52,7 @@
         localError = "";
         const inv = parseInvite(joinInput);
         if (!inv) {
-            localError = "Не похоже на код комнаты. Код состоит из 6 символов, например K7F4QD.";
+            localError = "Не похоже на код комнаты. Код состоит из 8 символов, например K7F4-QD2M.";
             return;
         }
         busy = true;
@@ -97,6 +97,7 @@
     function statusText(m) {
         if (!m.connected) return "переподключается…";
         if (m.unavailable) return "нет этой серии";
+        if (m.lagging) return "комната не ждёт: видео подвисает";
         if (m.status === "joining") return "заходит…";
         if (!m.ready) return "загружает";
         if (hostDuration && m.duration && Math.abs(m.duration - hostDuration) > 3 && m.mid !== s.hostMid) {
@@ -107,7 +108,7 @@
 
     function statusClass(m) {
         if (!m.connected || m.unavailable) return "bad";
-        if (m.status === "joining" || !m.ready) return "wait";
+        if (m.lagging || m.status === "joining" || !m.ready) return "wait";
         if (hostDuration && m.duration && Math.abs(m.duration - hostDuration) > 3 && m.mid !== s.hostMid) return "warn";
         return "ok";
     }
@@ -131,7 +132,7 @@
         <div class="wt-code-box flex-row">
             <div class="flex-column">
                 <span class="wt-label">Код комнаты</span>
-                <span class="wt-code">{s.code}</span>
+                <span class="wt-code">{formatCode(s.code)}</span>
             </div>
             <div class="wt-copy flex-column">
                 <BaseMainButton height={32} style="primary" onClickCallback={() => copy(invite.text, "text")}>
@@ -188,6 +189,14 @@
                     onchange={(e) => client.setGuestsCanControl(e.currentTarget.checked)}
                 />
                 <span>Гости тоже могут ставить паузу и перематывать</span>
+            </label>
+            <label class="wt-check flex-row">
+                <input
+                    type="checkbox"
+                    checked={s.settings.waitForStalls !== false}
+                    onchange={(e) => client.setWaitForStalls(e.currentTarget.checked)}
+                />
+                <span>Останавливать просмотр, если у кого-то зависло видео</span>
             </label>
             <span class="wt-note">Серию и озвучку выбираете только вы.</span>
         {:else}

@@ -12,12 +12,18 @@
 import { mediaKey } from "./watchTogether.js";
 
 export const SYNC_CONFIG = Object.freeze({
-    HARD_SEEK_S: 1.2, // больше — перематываем
+    HARD_SEEK_S: 1.5, // больше — перематываем
     SOFT_START_S: 0.25, // больше — подстраиваем скоростью
     SOFT_STOP_S: 0.08, // меньше — возвращаем обычную скорость
-    SOFT_FACTOR: 0.06,
+    SOFT_FACTOR: 0.04, // базовая поправка скорости...
+    SOFT_SLOPE: 0.06, // ...растёт с расхождением (на 1 с — ещё +6 %)...
+    SOFT_MAX: 0.12, // ...но не больше ±12 %
     LOOP_MS: 400,
-    BUFFER_REPORT_DELAY_MS: 450,
+    STALL_POLL_MS: 150, // как часто проверяем, «стоит ли» видео
+    STALL_REPORT_MS: 1200, // видео стоит без данных дольше — сообщаем комнате (короткие подвисания не в счёт)
+    DECODE_STALL_BUFFER_S: 1.0, // данные впереди есть, а видео стоит — это тормозит наш ПК, а не сеть: комнату не останавливаем
+    HINT_STALLS: 3, // столько подвисаний за минуту — подсказываем, что делать
+    HINT_COOLDOWN_MS: 5 * 60 * 1000,
     SEEK_DEBOUNCE_MS: 180,
     EXPECT_TTL_MS: 3000,
     READY_POLL_MS: 200,
@@ -45,6 +51,12 @@ export class VideoSync {
         this.seekTimer = null;
         this.startTimer = null;
         this.bufferTimer = null;
+        this.stallTimer = null;
+        this.stallPos = 0;
+        this.stallSince = 0;
+        this.stallLog = [];
+        this.lastHintAt = 0;
+        this.lagToasted = false;
         this.loopTimer = null;
         this.readyTimer = null;
         this.readyPending = false;
@@ -88,6 +100,7 @@ export class VideoSync {
         this.offs.push(this.client.on("state", (m) => this._onState(m)));
         this.offs.push(this.client.on("welcome", () => this._onWelcome()));
         this.offs.push(this.client.on("disconnected", () => this._clearTimers(false)));
+        this.offs.push(this.client.on("members", (m) => this._onMembers(m)));
 
         this.loopTimer = setInterval(() => this._loop(), this.cfg.LOOP_MS);
 
@@ -121,6 +134,7 @@ export class VideoSync {
         clearTimeout(this.seekTimer); this.seekTimer = null;
         clearTimeout(this.startTimer); this.startTimer = null;
         clearTimeout(this.bufferTimer); this.bufferTimer = null;
+        clearInterval(this.stallTimer); this.stallTimer = null;
         clearTimeout(this.readyTimer); this.readyTimer = null;
         if (all) { clearInterval(this.loopTimer); this.loopTimer = null; }
     }
@@ -159,6 +173,17 @@ export class VideoSync {
         this.pending.push(Date.now() + this.cfg.EXPECT_TTL_MS);
     }
 
+    /**
+     * Можно ли отправлять команды: в плеере открыта та же серия, что и в комнате.
+     * Пока хост переключает серию, старое видео успевает «выстрелить» событиями pause/seeked
+     * с позицией из прошлой серии — их отправлять нельзя.
+     */
+    _canSend() {
+        const roomMedia = this.client.snapshot.media;
+        if (!roomMedia) return false;
+        return this.client.loadedMediaKey === mediaKey(roomMedia);
+    }
+
     _isPending() {
         const now = Date.now();
         while (this.pending.length && this.pending[0] < now) this.pending.shift();
@@ -176,6 +201,7 @@ export class VideoSync {
     _onPlay() {
         if (this._consume("play") || !this.active) return;
         if (!this.canControl) { this._toastLocked(); return this._enforce(); }
+        if (!this._canSend()) return;
         this._flushSeek();
         this._markPending();
         this.client.sendPlay(this.video.currentTime);
@@ -184,6 +210,7 @@ export class VideoSync {
     _onPause() {
         if (this._consume("pause") || !this.active) return;
         if (!this.canControl) { this._toastLocked(); return this._enforce(); }
+        if (!this._canSend()) return;
         // перетаскивание таймлайна ставит на паузу — перемотку отправим отдельно
         this._markPending();
         this.client.sendPause(this.video.currentTime);
@@ -196,6 +223,7 @@ export class VideoSync {
         }
         if (!this.active) return;
         if (!this.canControl) { this._toastLocked(); return this._enforce(); }
+        if (!this._canSend()) return;
         clearTimeout(this.seekTimer);
         this.seekTimer = setTimeout(() => this._flushSeek(), this.cfg.SEEK_DEBOUNCE_MS);
     }
@@ -204,7 +232,7 @@ export class VideoSync {
         if (this.seekTimer == null) return;
         clearTimeout(this.seekTimer);
         this.seekTimer = null;
-        if (!this.video || !this.active || !this.canControl) return;
+        if (!this.video || !this.active || !this.canControl || !this._canSend()) return;
         this._markPending();
         this.client.sendSeek(this.video.currentTime);
     }
@@ -214,6 +242,7 @@ export class VideoSync {
         if (!v || !this.active) return;
         if (Math.abs(v.playbackRate - this.lastSetRate) < 0.001) return;
         if (!this.canControl) return this._enforce();
+        if (!this._canSend()) return;
         this.lastSetRate = v.playbackRate;
         this._markPending();
         this.client.sendRate(v.playbackRate, v.currentTime);
@@ -228,20 +257,77 @@ export class VideoSync {
     }
 
     // ── буферизация и готовность ────────────────────────────────────
+    /** Сколько секунд видео буферизовано впереди текущей позиции. */
+    _bufferedAhead() {
+        const v = this.video;
+        const t = v.currentTime;
+        const b = v.buffered;
+        if (!b) return 0;
+        for (let i = 0; i < b.length; i++) {
+            if (b.start(i) <= t + 0.15 && b.end(i) > t) return b.end(i) - t;
+        }
+        return 0;
+    }
+
     _onWaiting() {
-        if (!this.active || !this.room?.playing || this.bufferTimer) return;
-        this.bufferTimer = setTimeout(() => {
-            this.bufferTimer = null;
-            const v = this.video;
-            if (!v || !this.room?.playing || v.paused || v.readyState >= 3) return;
-            this.notReadyReported = true;
-            this.client.sendReady(false, v.currentTime, this.lastSeq);
-        }, this.cfg.BUFFER_REPORT_DELAY_MS);
+        if (!this.active || !this.room?.playing || this.stallTimer) return;
+        this.stallSince = Date.now();
+        this.stallPos = this.video.currentTime;
+        this.stallTimer = setInterval(() => this._checkStall(), this.cfg.STALL_POLL_MS);
+    }
+
+    _stopStallWatch() {
+        clearInterval(this.stallTimer);
+        this.stallTimer = null;
+    }
+
+    /**
+     * Комнату останавливаем только при настоящей остановке из-за сети: видео стоит на месте
+     * дольше STALL_REPORT_MS, данных впереди нет и мы не перематываем сами.
+     * Наша собственная подстроечная перемотка и тормоза декодера комнату не останавливают.
+     */
+    _checkStall() {
+        const v = this.video;
+        if (!v || !this.active || !this.room?.playing || v.paused || v.seeking || v.readyState >= 3) {
+            return this._stopStallWatch();
+        }
+        if (Math.abs(v.currentTime - this.stallPos) > 0.05) {
+            // видео двигалось — это была не остановка, отсчёт заново
+            this.stallPos = v.currentTime;
+            this.stallSince = Date.now();
+            return;
+        }
+        if (Date.now() - this.stallSince < this.cfg.STALL_REPORT_MS) return;
+        this._stopStallWatch();
+        this._noteStall();
+        if (this._bufferedAhead() >= this.cfg.DECODE_STALL_BUFFER_S) return; // тормозит ПК, а не сеть
+        this.notReadyReported = true;
+        this.client.sendReady(false, v.currentTime, this.lastSeq);
+    }
+
+    /** Подсказка, если видео подвисает снова и снова. */
+    _noteStall() {
+        const now = Date.now();
+        this.stallLog = this.stallLog.filter((t) => now - t < 60000);
+        this.stallLog.push(now);
+        if (this.stallLog.length >= this.cfg.HINT_STALLS && now - this.lastHintAt > this.cfg.HINT_COOLDOWN_MS) {
+            this.lastHintAt = now;
+            this.hooks.toast?.("Видео подвисает: попробуйте снизить качество или режим улучшения изображения");
+        }
+    }
+
+    _onMembers(m) {
+        const me = m.members.find((x) => x.mid === this.client.snapshot.mid);
+        if (me?.lagging && !this.lagToasted) {
+            this.lagToasted = true;
+            this.hooks.toast?.("Комната временно не ждёт вас: видео часто подвисает");
+        } else if (me && !me.lagging) {
+            this.lagToasted = false;
+        }
     }
 
     _onCanPlay() {
-        clearTimeout(this.bufferTimer);
-        this.bufferTimer = null;
+        this._stopStallWatch();
         if (this.notReadyReported) {
             this.readyPending = true;
             this._tryReady();
@@ -407,7 +493,9 @@ export class VideoSync {
         }
         if (abs > this.cfg.SOFT_START_S || (this.softActive && abs > this.cfg.SOFT_STOP_S)) {
             this.softActive = true;
-            this._setRate(st.rate * (diff > 0 ? 1 - this.cfg.SOFT_FACTOR : 1 + this.cfg.SOFT_FACTOR));
+            // чем больше расхождение, тем сильнее поправка (до ±12 %): так оно гасится быстрее
+            const k = Math.min(this.cfg.SOFT_MAX, this.cfg.SOFT_FACTOR + abs * this.cfg.SOFT_SLOPE);
+            this._setRate(st.rate * (diff > 0 ? 1 - k : 1 + k));
         } else {
             this.softActive = false;
             this._setRate(st.rate);

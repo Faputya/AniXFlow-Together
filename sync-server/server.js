@@ -74,6 +74,12 @@ function createServer({ hub = new Hub(), log = () => {} } = {}) {
   timers.forEach((t) => t.unref());
 
   server.stopTimers = () => timers.forEach(clearInterval);
+  // закрыть все открытые соединения комнат (при остановке сервера из приложения)
+  server.closeAll = () => {
+    for (const ws of [...hub.conns]) {
+      try { ws.close(1001); } catch (_) {}
+    }
+  };
   return server;
 }
 

@@ -1,5 +1,5 @@
 <script>
-    import { createEventDispatcher } from "svelte";
+    import { createEventDispatcher, onMount } from "svelte";
     import Icon from "../elements/Icon.svelte";
     import CloseIcon from "../../icons/close.svg";
     import BaseMainButton from "../buttons/BaseMainButton.svelte";
@@ -20,6 +20,57 @@
     let localError = "";
     let copied = "";
     let copiedTimer = null;
+
+    // сервер комнат на этом компьютере (для игры по Radmin VPN / ZeroTier)
+    const localApi = typeof window !== "undefined" ? window.localServerApi : null;
+    let local = { running: false, port: null, addresses: [] };
+    let localBusy = false;
+    let localError = "";
+
+    function cleanError(e) {
+        return String((e && e.message) || e).replace(/^Error invoking remote method '[^']+': (Error: )?/, "");
+    }
+
+    async function refreshLocal() {
+        if (!localApi) return;
+        try {
+            local = await localApi.status();
+        } catch (_) {}
+    }
+
+    async function startLocal() {
+        localBusy = true;
+        localError = "";
+        try {
+            local = await localApi.start(8787);
+            // подставляем лучший адрес (виртуальная сеть в приоритете), если он найден
+            if (local.addresses && local.addresses[0]) {
+                serverUrl = local.addresses[0].url;
+                persist();
+            }
+        } catch (e) {
+            localError = cleanError(e);
+        }
+        localBusy = false;
+    }
+
+    async function stopLocal() {
+        localBusy = true;
+        localError = "";
+        try {
+            local = await localApi.stop();
+        } catch (e) {
+            localError = cleanError(e);
+        }
+        localBusy = false;
+    }
+
+    function useAddress(a) {
+        serverUrl = a.url;
+        persist();
+    }
+
+    onMount(refreshLocal);
 
     $: s = $watch;
     $: inRoom = s.phase === "connected" || s.phase === "reconnecting";
@@ -257,6 +308,48 @@
             Если вас пригласили, адрес приходит вместе с кодом — вводить его не нужно.
         </span>
 
+        {#if localApi}
+            <details class="wt-local">
+                <summary>Сервер на этом компьютере (Radmin VPN, ZeroTier и т. п.)</summary>
+                <p class="wt-note">
+                    Подходит, если сайт хостинга у вас не открывается без VPN. Друзья подключаются к вашему компьютеру
+                    через общую виртуальную сеть, отдельный сайт или сервер не нужны. Все должны быть в одной сети
+                    (например, в Radmin VPN).
+                </p>
+                <div class="wt-actions flex-row">
+                    {#if local.running}
+                        <BaseMainButton height={32} style="default" isLoading={localBusy} onClickCallback={stopLocal}>
+                            <span class="wt-btn-text">Остановить сервер</span>
+                        </BaseMainButton>
+                    {:else}
+                        <BaseMainButton height={32} style="primary" isLoading={localBusy} onClickCallback={startLocal}>
+                            <span class="wt-btn-text">Запустить сервер</span>
+                        </BaseMainButton>
+                    {/if}
+                </div>
+                {#if local.running}
+                    <span class="wt-note">
+                        Сервер запущен (порт {local.port}). Адрес подставлен выше. Если Windows спросит разрешение для AniXFlow,
+                        разрешите доступ и в частных, и в общественных сетях: Radmin часто считается общественной.
+                    </span>
+                    <div class="wt-addrs flex-column">
+                        {#each local.addresses as a (a.ip + a.name)}
+                            <div class="wt-addr flex-row">
+                                <span class="wt-addr-kind">{a.kind}</span>
+                                <span class="wt-addr-url">{a.url}</span>
+                                <button class="wt-link" onclick={() => useAddress(a)}>использовать</button>
+                            </div>
+                        {:else}
+                            <span class="wt-note">Адреса не найдены: проверьте, что виртуальная сеть подключена.</span>
+                        {/each}
+                    </div>
+                {/if}
+                {#if localError}
+                    <div class="wt-error">{localError}</div>
+                {/if}
+            </details>
+        {/if}
+
         <label class="wt-check flex-row">
             <input type="checkbox" bind:checked={preferOffline} onchange={persist} />
             <span>Если серия скачана — смотреть из файла</span>
@@ -405,6 +498,46 @@
     .wt-join {
         gap: 10px;
         align-items: center;
+    }
+
+    .wt-local {
+        margin-top: 4px;
+        padding: 8px 4px;
+        font-size: 14px;
+    }
+
+    .wt-local summary {
+        cursor: pointer;
+        color: var(--secondary-text-color);
+    }
+
+    .wt-local summary:hover {
+        color: var(--main-text-color);
+    }
+
+    .wt-addrs {
+        gap: 4px;
+        margin-top: 6px;
+    }
+
+    .wt-addr {
+        align-items: center;
+        gap: 10px;
+        padding: 6px 10px;
+        border-radius: 10px;
+        background-color: var(--alt-background-color);
+        font-size: 13px;
+    }
+
+    .wt-addr-kind {
+        font-weight: 600;
+        min-width: 96px;
+    }
+
+    .wt-addr-url {
+        flex: 1;
+        user-select: text;
+        word-break: break-all;
     }
 
     .wt-error {

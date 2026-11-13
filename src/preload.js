@@ -122,6 +122,29 @@ contextBridge.exposeInMainWorld('offlineApi', {
   },
 });
 
+// Мост WebSocket: незашифрованные ws:// (Radmin VPN, ZeroTier) открываются в главном процессе
+const wsListeners = new Map();
+ipcRenderer.on('ws:event', (_event, msg) => {
+  const fn = msg && wsListeners.get(msg.id);
+  if (fn) fn(msg);
+});
+contextBridge.exposeInMainWorld('wsBridge', {
+  open: (id, url, onEvent) => {
+    wsListeners.set(String(id), onEvent);
+    ipcRenderer.send('ws:open', String(id), String(url));
+  },
+  send: (id, data) => ipcRenderer.send('ws:send', String(id), String(data)),
+  close: (id, code) => ipcRenderer.send('ws:close', String(id), code),
+  release: (id) => { wsListeners.delete(String(id)); },
+});
+
+// Сервер комнат в самом приложении (для игры по Radmin VPN / ZeroTier без отдельного хостинга)
+contextBridge.exposeInMainWorld('localServerApi', {
+  status: () => ipcRenderer.invoke('localServer:status'),
+  start: (port) => ipcRenderer.invoke('localServer:start', port),
+  stop: () => ipcRenderer.invoke('localServer:stop'),
+});
+
 contextBridge.exposeInMainWorld('watchApi', {
   getPendingInvite: () => ipcRenderer.invoke('watch:getPendingInvite'),
   onInvite: (callback) => {

@@ -13,6 +13,8 @@
  *  Его можно также задать в окне «Смотреть вместе»; в приглашении адрес передаётся автоматически. */
 export const DEFAULT_SERVER_URL = "";
 
+import { BridgeSocket } from "./bridgeSocket.js";
+
 const SETTINGS_KEY = "watchTogetherSettings";
 const CID_KEY = "watchTogetherCid";
 const CODE_RE = /^[A-HJKMNP-Z2-9]{6,10}$/; // сейчас коды из 8 символов; 6 — у комнат на старом сервере
@@ -60,8 +62,28 @@ export function normalizeServerUrl(input) {
     let u = String(input || "").trim();
     if (!u) return "";
     u = u.replace(/^http:\/\//i, "ws://").replace(/^https:\/\//i, "wss://");
-    if (!/^wss?:\/\//i.test(u)) u = "wss://" + u;
+    if (!/^wss?:\/\//i.test(u)) {
+        // «26.1.2.3:8787» и «localhost:8787» — это сервер в локальной/виртуальной сети (без TLS),
+        // а «имя.onrender.com» — обычный сайт с шифрованием
+        const host = u.split(/[/:?#]/)[0];
+        const plain = host === "localhost" || /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+        u = (plain ? "ws://" : "wss://") + u;
+    }
     return u.replace(/\/+$/, "");
+}
+
+/** Обычный (незашифрованный) ws:// — сервер в локальной или виртуальной сети. */
+export function isPlainWs(url) {
+    return /^ws:\/\//i.test(String(url || ""));
+}
+
+/**
+ * Открывает сокет. Незашифрованный ws:// защищённая страница приложения открыть не может,
+ * поэтому там, где есть мост главного процесса (window.wsBridge), используем его.
+ */
+export function defaultMakeSocket(url, WS) {
+    if (isPlainWs(url) && globalThis.wsBridge) return new BridgeSocket(url, globalThis.wsBridge);
+    return new WS(url);
 }
 
 export function httpUrlFor(wsUrl) {
@@ -174,6 +196,7 @@ const initialState = () => ({
 export class SyncClient {
     constructor(opts = {}) {
         this.WS = opts.WebSocket || globalThis.WebSocket;
+        this.makeSocket = opts.makeSocket || ((url) => defaultMakeSocket(url, this.WS));
         this.fetchFn = opts.fetch || (globalThis.fetch ? globalThis.fetch.bind(globalThis) : null);
         this.nowFn = opts.now || Date.now;
         this.storage = opts.storage === undefined ? safeStorage() : opts.storage;
@@ -325,6 +348,13 @@ export class SyncClient {
             return;
         } catch (firstErr) {
             if (token !== this.attemptToken || this.intentionalClose) throw firstErr;
+            if (isPlainWs(serverUrl)) {
+                // сервер в локальной/виртуальной сети не «спит»: будить нечего, причина в сети или адресе
+                throw new Error(
+                    "Не удалось подключиться к серверу. Проверьте, что сервер запущен, что Radmin VPN (или ZeroTier) " +
+                    "подключён у обоих и что Windows разрешила AniXFlow принимать подключения (брандмауэр)."
+                );
+            }
         }
         // бесплатные хостинги «засыпают»: будим запросом на /health и пробуем снова
         this._patch({ phase: "waking" });
@@ -336,6 +366,7 @@ export class SyncClient {
     }
 
     async _wakeUp(serverUrl, token) {
+        if (isPlainWs(serverUrl)) return false;
         if (!this.fetchFn) return true; // будить нечем — просто пробуем подключиться
         const url = httpUrlFor(serverUrl) + "/health";
         const deadline = this.nowFn() + this.timing.wakeTimeout;
@@ -361,7 +392,7 @@ export class SyncClient {
             let settled = false;
             let ws;
             try {
-                ws = new this.WS(serverUrl);
+                ws = this.makeSocket(serverUrl);
             } catch (e) {
                 return reject(new Error("Неверный адрес сервера"));
             }

@@ -677,6 +677,13 @@ app.on('ready', () => {
   }
   initDownloader();
   watchInvite.init({ app, ipcMain, getMainWindow: () => mainWindow });
+  try {
+    // совместный просмотр: мост ws:// для интерфейса и сервер комнат в самом приложении
+    require('./wsBridge').init({ ipcMain, isTrustedSender: isTrustedIpcSender });
+    require('./localServer').init({ app, ipcMain });
+  } catch (e) {
+    console.error('[watch-together] init failed:', e);
+  }
   createTray();
   createWindow();
   if (isDebugMode) {

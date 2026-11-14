@@ -25,7 +25,7 @@
     const localApi = typeof window !== "undefined" ? window.localServerApi : null;
     let local = { running: false, port: null, addresses: [] };
     let localBusy = false;
-    let localError = "";
+    let localServerError = "";
 
     function cleanError(e) {
         return String((e && e.message) || e).replace(/^Error invoking remote method '[^']+': (Error: )?/, "");
@@ -40,7 +40,7 @@
 
     async function startLocal() {
         localBusy = true;
-        localError = "";
+        localServerError = "";
         try {
             local = await localApi.start(8787);
             // подставляем лучший адрес (виртуальная сеть в приоритете), если он найден
@@ -49,18 +49,18 @@
                 persist();
             }
         } catch (e) {
-            localError = cleanError(e);
+            localServerError = cleanError(e);
         }
         localBusy = false;
     }
 
     async function stopLocal() {
         localBusy = true;
-        localError = "";
+        localServerError = "";
         try {
             local = await localApi.stop();
         } catch (e) {
-            localError = cleanError(e);
+            localServerError = cleanError(e);
         }
         localBusy = false;
     }
@@ -344,8 +344,8 @@
                         {/each}
                     </div>
                 {/if}
-                {#if localError}
-                    <div class="wt-error">{localError}</div>
+                {#if localServerError}
+                    <div class="wt-error">{localServerError}</div>
                 {/if}
             </details>
         {/if}
